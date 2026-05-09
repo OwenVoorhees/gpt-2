@@ -164,7 +164,12 @@ class GPT(nn.Module):
 num_return_sequences = 5
 max_length = 30
 
-model = GPT.from_pretrained('gpt2')
+# GPT-2 from open AI
+# model = GPT.from_pretrained('gpt2')
+
+# Our model
+model = GPT(GPTConfig())
+
 print("didn't crash yay!")
 model.eval()
 model.to('cuda')
