@@ -161,6 +161,16 @@ class GPT(nn.Module):
         return model
 
 # -----------------------------------------------------------------------------
+
+# attempt to autodetect the device
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = "mps"
+print(f"using device: {device}")
+
+
 num_return_sequences = 5
 max_length = 30
 
@@ -172,7 +182,7 @@ model = GPT(GPTConfig())
 
 print("didn't crash yay!")
 model.eval()
-model.to('cuda')
+model.to(device)
 
 # prefix tokens
 import tiktoken
