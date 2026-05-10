@@ -18,6 +18,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -35,15 +36,23 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
         # attention (materializes the large (T,T) matrix for all the queries and keys)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # flash attention optimizes these lines
+        #att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        #att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        #att = F.softmax(att, dim=-1)
+        #y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
         return y
+    
+class TanhGELU(nn.Module):
+    def forward(self, x):
+        return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * torch.pow(x, 3))))
 
 class MLP(nn.Module):
 
@@ -52,7 +61,8 @@ class MLP(nn.Module):
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu    = nn.GELU(approximate='tanh')
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
-
+        self.c_proj.NANOGPT_SCALE_INIT = 1
+        
     def forward(self, x):
         x = self.c_fc(x)
         x = self.gelu(x)
@@ -82,14 +92,14 @@ class GPTConfig:
     n_head: int = 12 # number of heads
     n_embd: int = 768 # embedding dimension
 
-
 class DataLoaderLite:
     def __init__(self, B, T):
         self.B = B
         self.T = T
 
         # at init load tokens from disk and store them in memory
-        with open('input.txt', 'r') as f:
+        with open('/input.txt', 'r') as f:
+        #with open('input.txt', 'r') as f:
             text = f.read()
         enc = tiktoken.get_encoding('gpt2')
         tokens = enc.encode(text)
@@ -213,6 +223,7 @@ class GPT(nn.Module):
         return model
 
 # -----------------------------------------------------------------------------
+import time
 
 # attempt to autodetect the device
 device = "cpu"
@@ -221,25 +232,39 @@ if torch.cuda.is_available():
 elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     device = "mps"
 print(f"using device: {device}")
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(1337)
 
 # get a data batch
-train_loader = DataLoaderLite(B=4, T=32)
+train_loader = DataLoaderLite(B=4, T=1024)
+
+torch.set_float32_matmul_precision('high') # for faster training on Ampere+ GPUs, with a possible loss of accuracy
 
 # get logits
 # model = GPT.from_pretrained('gpt2') # GPT-2 from open AI
 model = GPT(GPTConfig()) # Our model
 model.to(device)
+model = torch.compile(model) # use torch.compile to optimize the model (requires PyTorch 2.0+)  
+
 
 # optimize the model
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    # use bfloat 16 for forward pass only. (for T4s, use float16 instead, but for Ampere+ GPUs, bfloat16 is faster and just as accurate)
+    with torch.autocast(device_type=device, dtype=torch.float16):
+        logits, loss = model(x, y)
+        import code; code.interact(local=locals())
     loss.backward()
     optimizer.step()
-    print(f"step {i}, loss : {loss.item()}")
+    torch.cuda.synchronize() # wait for GPU to finish before measuring time
+    t1 = time.time()
+    dt = (t1 - t0) * 1000
+    tokens_per_sec = train_loader.B * train_loader.T / (t1 - t0)
+    print(f"step {i}, loss : {loss.item()}, time: {dt:.2f} ms, tokens/sec: {tokens_per_sec:.2f}")
 
 import sys; sys.exit(0)
 
